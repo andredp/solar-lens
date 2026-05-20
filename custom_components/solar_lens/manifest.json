@@ -4,8 +4,9 @@
   "codeowners": ["@andredp"],
   "config_flow": true,
   "documentation": "https://github.com/andredp/solar-lens",
-  "issue_tracker": "https://github.com/andredp/solar-lens/issues",
+  "homeassistant": "2026.1.0",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/andredp/solar-lens/issues",
   "requirements": ["scikit-learn==1.6.1"],
   "version": "0.1.0"
 }
