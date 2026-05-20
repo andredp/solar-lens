@@ -15,7 +15,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-      - run: uv python install 3.12
+      - run: uv python install 3.13
       - run: uv sync --dev
       - name: Ruff lint
         run: uv run ruff check .
@@ -30,10 +30,10 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-      - run: uv python install 3.12
+      - run: uv python install 3.13
       - run: uv sync --dev
       - name: Mypy
-        run: uv run mypy .
+        run: uv run mypy custom_components/
 
   test:
     runs-on: ubuntu-latest
@@ -43,10 +43,10 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-      - run: uv python install 3.12
+      - run: uv python install 3.13
       - run: uv sync --dev
       - name: Pytest
-        run: uv run pytest -v --cov=solar_lens
+        run: uv run pytest -v --cov=custom_components/solar_lens
 
   security:
     runs-on: ubuntu-latest
@@ -56,7 +56,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-      - run: uv python install 3.12
+      - run: uv python install 3.13
       - run: uv sync --dev
       - name: Bandit
-        run: uv run bandit -r solar_lens/
+        run: uv run bandit -r custom_components/solar_lens/
