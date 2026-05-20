@@ -3,21 +3,13 @@
   "extends": ["config:recommended"],
   "packageRules": [
     {
-      "description": "Group HA stubs bump with manifest/hacs.json version updates",
+      "description": "Group HA stubs bump with hacs.json version update",
       "matchPackageNames": ["homeassistant-stubs"],
       "groupName": "home-assistant-version",
       "commitMessageTopic": "Home Assistant minimum version"
     }
   ],
   "customManagers": [
-    {
-      "customType": "regex",
-      "fileMatch": ["custom_components/solar_lens/manifest\\.json$"],
-      "matchStrings": ["\"homeassistant\":\\s*\"(?<currentValue>[^\"]+)\""],
-      "depNameTemplate": "homeassistant-stubs",
-      "datasourceTemplate": "pypi",
-      "versioningTemplate": "loose"
-    },
     {
       "customType": "regex",
       "fileMatch": ["hacs\\.json$"],

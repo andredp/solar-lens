@@ -8,7 +8,7 @@ import sys
 import urllib.request
 
 MAX_GAP_MONTHS = 4
-MANIFEST_PATH = "custom_components/solar_lens/manifest.json"
+MANIFEST_PATH = "hacs.json"
 
 
 def get_latest_ha_version() -> str:
