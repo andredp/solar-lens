@@ -21,14 +21,14 @@ def get_latest_ha_version() -> str:
         v for v in data["releases"] if all(tag not in v for tag in ("a", "b", "dev", "rc"))
     ]
     stable_versions.sort(key=lambda v: [int(x) for x in v.split(".")])
-    return stable_versions[-1]
+    return str(stable_versions[-1])
 
 
 def get_our_minimum_version() -> str:
     """Read the minimum HA version from our manifest.json."""
     with open(MANIFEST_PATH) as f:
         manifest = json.load(f)
-    return manifest["homeassistant"]
+    return str(manifest["homeassistant"])
 
 
 def version_to_months(version: str) -> int:

@@ -11,3 +11,6 @@ build/
 .pytest_cache/
 htmlcov/
 .coverage
+.agyrules
+.antigravitycli/
+ROADMAP.md
