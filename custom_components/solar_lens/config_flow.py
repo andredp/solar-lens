@@ -12,6 +12,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required("soc_entity"): str,
         vol.Required("consumption_entity"): str,
         vol.Required("solar_forecast_entity"): str,
+        vol.Required("weather_entity"): str,
         vol.Required("battery_capacity_kwh"): vol.Coerce(float),
     }
 )
