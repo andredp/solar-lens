@@ -154,7 +154,6 @@ class SolarLensTomorrowSunsetSoCEstimate(SolarLensBaseSensor):
         return float(val) if val is not None else None
 
 
-
 class SolarLensPredictionCurve(SolarLensBaseSensor):
     """Sensor exposing the 48-hour predicted SoC curve in attributes."""
 

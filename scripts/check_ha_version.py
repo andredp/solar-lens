@@ -14,7 +14,7 @@ MANIFEST_PATH = "hacs.json"
 def get_latest_ha_version() -> str:
     """Fetch the latest stable Home Assistant version from PyPI."""
     url = "https://pypi.org/pypi/homeassistant/json"
-    with urllib.request.urlopen(url) as response:
+    with urllib.request.urlopen(url) as response:  # noqa: S310
         data = json.loads(response.read())
 
     stable_versions = [
