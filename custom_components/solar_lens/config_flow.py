@@ -14,6 +14,11 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required("solar_forecast_entity"): str,
         vol.Required("weather_entity"): str,
         vol.Required("battery_capacity_kwh"): vol.Coerce(float),
+        vol.Optional("actual_solar_entity"): str,
+        vol.Optional("charge_limit_entity"): str,
+        vol.Optional("discharge_limit_entity"): str,
+        vol.Optional("battery_voltage_entity"): str,
+        vol.Optional("battery_temp_entity"): str,
     }
 )
 

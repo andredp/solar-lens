@@ -1,5 +1,7 @@
 """Data update coordinator for Solar Lens integration."""
 
+import asyncio
+import contextlib
 import logging
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,6 +14,8 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.tree import DecisionTreeRegressor
 
 from .ml.feature_engineering import compute_rolling_mean, extract_time_features
 from .ml.simulator import SolarBatterySimulator
@@ -40,9 +44,21 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.weather_entity_id = entry.data["weather_entity"]
         self.battery_capacity_kwh = float(entry.data["battery_capacity_kwh"])
 
-        # ML model and training state
-        self.model: HistGradientBoostingRegressor | None = None
+        self.actual_solar_entity_id = entry.data.get("actual_solar_entity")
+        self.charge_limit_entity_id = entry.data.get("charge_limit_entity")
+        self.discharge_limit_entity_id = entry.data.get("discharge_limit_entity")
+        self.battery_voltage_entity_id = entry.data.get("battery_voltage_entity")
+        self.battery_temp_entity_id = entry.data.get("battery_temp_entity")
+
+        # ML models and training state
+        self.consumption_model: HistGradientBoostingRegressor | None = None
+        self.solar_model: HistGradientBoostingRegressor | None = None
+        self.temp_model: Ridge | None = None
+        self.charge_limit_model: DecisionTreeRegressor | None = None
+        self.discharge_limit_model: DecisionTreeRegressor | None = None
+
         self.last_trained: datetime | None = None
+        self._training_task: asyncio.Task[None] | None = None
         self.recent_consumption_baseline = 0.5  # fallback kW
 
         # Initialize physical simulator (default efficiency: 95%, min SoC: 10%)
@@ -53,8 +69,14 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             min_soc=10.0,
         )
 
+    def _to_celsius(self, temp: float, unit: str | None) -> float:
+        """Convert Fahrenheit to Celsius if needed."""
+        if unit in ("°F", "F"):
+            return (temp - 32.0) * 5.0 / 9.0
+        return temp
+
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data, retrain model if needed, and run simulation."""
+        """Fetch data, trigger background training, and run simulation."""
         try:
             # 1. Get current battery SoC
             soc_state = self.hass.states.get(self.soc_entity_id)
@@ -66,42 +88,156 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             solar_forecast_state = self.hass.states.get(self.solar_forecast_entity_id)
             solar_forecast = self._parse_solar_forecast(solar_forecast_state)
 
-            # 3. Check if we need to retrain the consumption model
+            # 3. Trigger background retraining if needed
             now = dt_util.utcnow()
             if (
-                self.model is None
-                or self.last_trained is None
+                self.last_trained is None
                 or (now - self.last_trained) > timedelta(hours=1)
+            ) and (
+                not hasattr(self, "_training_task")
+                or self._training_task is None
+                or self._training_task.done()
             ):
-                _LOGGER.info("Starting background retraining of consumption model")
-                await self._async_retrain_model()
+                _LOGGER.info("Starting background retraining of ML models")
+                self._training_task = self.hass.async_create_background_task(
+                    self._async_retrain_models(),
+                    "solar_lens_retrain_models",
+                )
 
-            # 4. Generate 48h simulation grid (5-min intervals)
-            grid_5min = [now + timedelta(minutes=5 * i) for i in range(288 * 2)]
+            # 4. Generate local 48h simulation grid (5-min intervals)
+            local_now = dt_util.as_local(now)
+            grid_5min = [local_now + timedelta(minutes=5 * i) for i in range(288 * 2)]
             grid_timestamps = np.array(grid_5min)
 
-            # Fetch and interpolate temperature forecast
+            # Fetch temperature forecast and convert to Celsius
             temp_forecast = await self._async_get_temperature_forecast()
-            predicted_temp = self._interpolate_temperature_forecast(temp_forecast, grid_timestamps)
+            temp_forecast.sort(key=lambda x: x[0])
 
-            # Predict consumption baseline for each grid step
+            # Detect temperature unit
+            is_f = False
+            weather_state = self.hass.states.get(self.weather_entity_id)
+            if weather_state:
+                attrs = weather_state.attributes
+                unit = attrs.get("temperature_unit") or attrs.get("unit_of_measurement")
+                if unit in ("°F", "F"):
+                    is_f = True
+
+            predicted_temp_raw = self._interpolate_temperature_forecast(
+                temp_forecast, grid_timestamps
+            )
+            predicted_temp = [
+                self._to_celsius(t, "F" if is_f else None) for t in predicted_temp_raw
+            ]
+
+            # Predict consumption baseline
             predicted_consumption = self._predict_consumption(grid_5min, predicted_temp)
 
-            # Interpolate solar forecast to 5-min grid
-            predicted_solar = self._interpolate_solar_forecast(solar_forecast, grid_timestamps)
+            # Interpolate raw solar forecast and refine
+            raw_solar_5min = self._interpolate_solar_forecast(solar_forecast, grid_timestamps)
+            predicted_solar = self._predict_solar(grid_5min, raw_solar_5min)
 
-            # 5. Run forward physical simulation
-            sim_results = self.simulator.run_simulation(
-                initial_soc=current_soc,
-                solar_forecast=predicted_solar,
-                consumption_forecast=predicted_consumption,
-            )
+            # Read live voltage and battery temp
+            live_voltage = 48.0
+            if self.battery_voltage_entity_id:
+                volt_state = self.hass.states.get(self.battery_voltage_entity_id)
+                if volt_state and volt_state.state not in (None, "unknown", "unavailable"):
+                    with contextlib.suppress(ValueError):
+                        live_voltage = float(volt_state.state)
+
+            live_bat_temp = predicted_temp[0]
+            if self.battery_temp_entity_id:
+                btemp_state = self.hass.states.get(self.battery_temp_entity_id)
+                if btemp_state and btemp_state.state not in (None, "unknown", "unavailable"):
+                    try:
+                        btemp_unit = btemp_state.attributes.get("unit_of_measurement")
+                        live_bat_temp = self._to_celsius(float(btemp_state.state), btemp_unit)
+                    except ValueError:
+                        pass
+
+            # 5. Run sequential physical simulation loop with ML model clamping
+            soc_curve = []
+            wasted_solar_curve = []
+            grid_import_curve = []
+            net_flow_curve = []
+
+            battery_energy = (current_soc / 100.0) * self.battery_capacity_kwh
+            dt = 5.0 / 60.0
+            current_soc_sim = current_soc
+            current_bat_temp_sim = live_bat_temp
+
+            for i in range(len(grid_5min)):
+                solar = predicted_solar[i]
+                consumption = predicted_consumption[i]
+                out_temp = predicted_temp[i]
+
+                # Predict battery temperature using unclamped net flow proxy
+                diff = solar - consumption
+                if diff > 0:
+                    est_net_flow = diff * self.simulator.charge_efficiency
+                else:
+                    est_net_flow = diff / self.simulator.discharge_efficiency
+
+                if self.temp_model is not None:
+                    try:
+                        X_t = np.array([[out_temp, abs(est_net_flow), est_net_flow ** 2]])
+                        current_bat_temp_sim = float(self.temp_model.predict(X_t)[0])
+                    except Exception:
+                        current_bat_temp_sim = out_temp
+                else:
+                    current_bat_temp_sim = 0.9 * current_bat_temp_sim + 0.1 * out_temp
+
+                # Predict BMS charge/discharge limit (Amps)
+                if self.charge_limit_model is not None:
+                    try:
+                        pred_charge_limit_a = float(
+                            self.charge_limit_model.predict(
+                                [[current_soc_sim, current_bat_temp_sim]]
+                            )[0]
+                        )
+                    except Exception:
+                        pred_charge_limit_a = 75.0
+                else:
+                    pred_charge_limit_a = 75.0
+
+                if self.discharge_limit_model is not None:
+                    try:
+                        pred_discharge_limit_a = float(
+                            self.discharge_limit_model.predict(
+                                [[current_soc_sim, current_bat_temp_sim]]
+                            )[0]
+                        )
+                    except Exception:
+                        pred_discharge_limit_a = 75.0
+                else:
+                    pred_discharge_limit_a = 75.0
+
+                # Convert limits (Amps) to power (kW)
+                max_charge_power_kw = (pred_charge_limit_a * live_voltage) / 1000.0
+                max_discharge_power_kw = (pred_discharge_limit_a * live_voltage) / 1000.0
+
+                # Step simulation
+                (
+                    battery_energy,
+                    net_flow_val,
+                    wasted,
+                    imported,
+                ) = self.simulator.update_battery_state(
+                    battery_energy,
+                    solar,
+                    consumption,
+                    dt,
+                    max_charge_power_kw,
+                    max_discharge_power_kw,
+                )
+
+                current_soc_sim = (battery_energy / self.battery_capacity_kwh) * 100.0
+
+                soc_curve.append(float(current_soc_sim))
+                wasted_solar_curve.append(float(wasted))
+                grid_import_curve.append(float(imported))
+                net_flow_curve.append(float(net_flow_val))
 
             # 6. Calculate sensors based on simulation curves
-            soc_curve = sim_results["soc"]
-            sim_results["wasted_solar"]
-            sim_results["grid_import"]
-
             # battery_empty_time & hours_remaining
             battery_empty_idx = -1
             for idx, val in enumerate(soc_curve):
@@ -117,8 +253,6 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 hours_remaining = 48.0
 
             # charge_resume_time
-            # Find the first time solar exceeds consumption after battery empties
-            # (or starting from now if battery is currently empty)
             charge_resume_time = None
             start_search_idx = max(0, battery_empty_idx)
             if battery_empty_idx != -1 or current_soc <= self.simulator.min_soc + 0.1:
@@ -133,10 +267,8 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 gap_hours = float((charge_resume_time - empty_time).total_seconds() / 3600.0)
 
             # tomorrow_sunset_soc_estimate
-            # Estimate tomorrow's sunset: find when solar production drops to 0 tomorrow afternoon
             tomorrow_sunset_idx = -1
-            tomorrow_date = (now + timedelta(days=1)).date()
-            # Look at steps falling on tomorrow between 3 PM (15:00) and 10 PM (22:00)
+            tomorrow_date = (local_now + timedelta(days=1)).date()
             for idx, ts in enumerate(grid_5min):
                 if (
                     ts.date() == tomorrow_date
@@ -153,7 +285,6 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 tomorrow_sunset_soc = soc_curve[288]
 
             # will_battery_last_the_night
-            # Battery lasts the night if it doesn't hit empty floor before tomorrow's charge resume
             will_battery_last = not (
                 empty_time is not None
                 and (charge_resume_time is None or empty_time < charge_resume_time)
@@ -180,102 +311,219 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             raise UpdateFailed(f"Error updating solar prediction data: {err}") from err
 
-    async def _async_retrain_model(self) -> None:
-        """Fetch historical statistics and train the model in the background executor."""
-        now = dt_util.utcnow()
-        start_time = now - timedelta(days=90)  # load up to 90 days of statistics
+    async def _async_fetch_hourly_data(
+        self, entity_id: str, start_time: datetime, default_val: float
+    ) -> dict[datetime, float]:
+        """Fetch hourly history/statistics for an entity and return {local_hour_ts: value}."""
+        data: dict[datetime, float] = {}
 
-        # Fetch hourly statistics for house consumption (and temperature sensor if it is a sensor)
-        stat_ids = {self.consumption_entity_id}
-        is_temp_sensor = self.weather_entity_id.startswith("sensor.")
-        if is_temp_sensor:
-            stat_ids.add(self.weather_entity_id)
-
-        stats_dict = await self.hass.async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            start_time,
-            None,
-            stat_ids,
-            "hour",
-            None,
-            {"mean", "sum", "state"},
-        )
-
-        consumption_rows = stats_dict.get(self.consumption_entity_id, [])
-        if not consumption_rows:
-            _LOGGER.warning(
-                "No statistics found for consumption entity %s. Using fallback baseline.",
-                self.consumption_entity_id,
-            )
-            self._train_fallback_model()
-            return
-
-        # Parse consumption data into {hour_ts: value}
-        consumption_data = {}
-        for r in consumption_rows:
-            val = self._parse_stat_value(r)
-            if val is not None:
-                ts = self._parse_stat_start(r["start"])
-                hour_ts = ts.replace(minute=0, second=0, microsecond=0)
-                consumption_data[hour_ts] = val
-
-        # Parse temperature data
-        temperature_data = {}
-        if is_temp_sensor:
-            temp_rows = stats_dict.get(self.weather_entity_id, [])
-            for r in temp_rows:
-                val = self._parse_stat_value(r)
-                if val is not None:
-                    ts = self._parse_stat_start(r["start"])
-                    hour_ts = ts.replace(minute=0, second=0, microsecond=0)
-                    temperature_data[hour_ts] = val
-        else:
-            # Query recorder history for the weather entity
-            temp_history = await self.hass.async_add_executor_job(
-                state_changes_during_period,
+        # 1. Try statistics first
+        try:
+            stats_dict = await self.hass.async_add_executor_job(
+                statistics_during_period,
                 self.hass,
                 start_time,
                 None,
-                self.weather_entity_id,
+                {entity_id},
+                "hour",
+                None,
+                {"mean", "sum", "state"},
             )
-            history_rows = temp_history.get(self.weather_entity_id, [])
-            for state in history_rows:
+            rows = stats_dict.get(entity_id, [])
+            for r in rows:
+                val = self._parse_stat_value(r)
+                if val is not None:
+                    ts = self._parse_stat_start(r["start"])
+                    local_ts = dt_util.as_local(ts)
+                    hour_ts = local_ts.replace(minute=0, second=0, microsecond=0)
+                    data[hour_ts] = val
+            if data:
+                return data
+        except Exception as err:
+            _LOGGER.debug("Statistics not available for %s: %s", entity_id, err)
+
+        # 2. Fallback to state changes from recorder for the last 10 days
+        try:
+            recorder_start = max(start_time, dt_util.utcnow() - timedelta(days=10))
+            history_dict = await self.hass.async_add_executor_job(
+                state_changes_during_period,
+                self.hass,
+                recorder_start,
+                None,
+                entity_id,
+            )
+            rows = history_dict.get(entity_id, [])
+
+            hourly_sums: dict[datetime, float] = {}
+            hourly_counts: dict[datetime, int] = {}
+
+            for state in rows:
                 if state.state not in (None, "unknown", "unavailable"):
-                    temp_val = state.attributes.get("temperature")
-                    if temp_val is not None:
-                        hour_ts = state.last_updated.replace(minute=0, second=0, microsecond=0)
-                        temperature_data[hour_ts] = float(temp_val)
+                    try:
+                        val = float(state.state)
+                        local_ts = dt_util.as_local(state.last_updated)
+                        hour_ts = local_ts.replace(minute=0, second=0, microsecond=0)
+                        hourly_sums[hour_ts] = hourly_sums.get(hour_ts, 0.0) + val
+                        hourly_counts[hour_ts] = hourly_counts.get(hour_ts, 0) + 1
+                    except ValueError:
+                        continue
 
-        # Align both time series
-        aligned_timestamps = []
-        aligned_consumption = []
-        aligned_temperature = []
+            for hour_ts, total in hourly_sums.items():
+                data[hour_ts] = total / hourly_counts[hour_ts]
+        except Exception as err:
+            _LOGGER.warning("Failed to fetch history for %s: %s", entity_id, err)
 
-        for hour_ts in sorted(consumption_data.keys()):
-            if hour_ts in temperature_data:
-                aligned_timestamps.append(hour_ts)
-                aligned_consumption.append(consumption_data[hour_ts])
-                aligned_temperature.append(temperature_data[hour_ts])
+        return data
 
-        if len(aligned_timestamps) < 24:
-            _LOGGER.warning("Insufficient aligned history to train ML model. Using fallback.")
-            self._train_fallback_model()
+    def _align_and_fill(
+        self,
+        grid: list[datetime],
+        raw_data: dict[datetime, float],
+        default_value: float,
+    ) -> np.ndarray:
+        """Align raw_data dictionary to grid timestamps using forward-fill."""
+        values = []
+        last_val = None
+        sorted_keys = sorted(raw_data.keys())
+
+        for ts in grid:
+            if ts in raw_data:
+                last_val = raw_data[ts]
+            elif last_val is None:
+                # Backward-fill from first available future key
+                future_keys = [k for k in sorted_keys if k > ts]
+                last_val = raw_data[future_keys[0]] if future_keys else default_value
+            values.append(last_val)
+        return np.array(values)
+
+    async def _async_retrain_models(self) -> None:
+        """Fetch historical statistics and train all 5 ML models in the background."""
+        now = dt_util.utcnow()
+        start_time = now - timedelta(days=90)
+
+        # Fetch required data
+        consumption_raw = await self._async_fetch_hourly_data(
+            self.consumption_entity_id, start_time, 0.5
+        )
+        weather_raw = await self._async_fetch_hourly_data(
+            self.weather_entity_id, start_time, 20.0
+        )
+        soc_raw = await self._async_fetch_hourly_data(
+            self.soc_entity_id, start_time, 50.0
+        )
+
+        # Fetch optional data
+        actual_solar_raw = {}
+        if self.actual_solar_entity_id:
+            actual_solar_raw = await self._async_fetch_hourly_data(
+                self.actual_solar_entity_id, start_time, 0.0
+            )
+
+        battery_temp_raw = {}
+        if self.battery_temp_entity_id:
+            battery_temp_raw = await self._async_fetch_hourly_data(
+                self.battery_temp_entity_id, start_time, 20.0
+            )
+
+        charge_limit_raw = {}
+        if self.charge_limit_entity_id:
+            charge_limit_raw = await self._async_fetch_hourly_data(
+                self.charge_limit_entity_id, start_time, 75.0
+            )
+
+        discharge_limit_raw = {}
+        if self.discharge_limit_entity_id:
+            discharge_limit_raw = await self._async_fetch_hourly_data(
+                self.discharge_limit_entity_id, start_time, 75.0
+            )
+
+        raw_solar_forecast_raw = {}
+        with contextlib.suppress(Exception):
+            raw_solar_forecast_raw = await self._async_fetch_hourly_data(
+                self.solar_forecast_entity_id, start_time, 0.0
+            )
+
+        # Align to hourly grid
+        grid = sorted(consumption_raw.keys())
+        if len(grid) < 24:
+            _LOGGER.warning("Insufficient history to train ML models. Retrying later.")
+            self.last_trained = now
             return
 
-        timestamps = aligned_timestamps
-        values = np.array(aligned_consumption)
-        temps = np.array(aligned_temperature)
+        # Align variables
+        consumption = np.array([consumption_raw[ts] for ts in grid])
+        outdoor_temp = self._align_and_fill(grid, weather_raw, 20.0)
+        soc = self._align_and_fill(grid, soc_raw, 50.0)
 
-        # Compute rolling mean over past 24 hours to use as recent baseline feature
-        roll_mean_24 = compute_rolling_mean(values, 24)
-        roll_mean_24_shifted = np.roll(roll_mean_24, 1)
-        roll_mean_24_shifted[0] = roll_mean_24[0]
+        actual_solar = (
+            self._align_and_fill(grid, actual_solar_raw, 0.0)
+            if self.actual_solar_entity_id
+            else np.zeros(len(grid))
+        )
+        battery_temp = (
+            self._align_and_fill(grid, battery_temp_raw, 20.0)
+            if self.battery_temp_entity_id
+            else outdoor_temp.copy()
+        )
+        charge_limit = (
+            self._align_and_fill(grid, charge_limit_raw, 75.0)
+            if self.charge_limit_entity_id
+            else np.full(len(grid), 75.0)
+        )
+        discharge_limit = (
+            self._align_and_fill(grid, discharge_limit_raw, 75.0)
+            if self.discharge_limit_entity_id
+            else np.full(len(grid), 75.0)
+        )
+        raw_solar_forecast = self._align_and_fill(grid, raw_solar_forecast_raw, 0.0)
 
-        # Extract features
-        time_feats = extract_time_features(timestamps)
-        X = np.column_stack(
-            [
+        # Calculate historical DC power flow proxy
+        hist_diff = actual_solar - consumption
+        hist_net_flow = np.where(
+            hist_diff > 0,
+            hist_diff * self.simulator.charge_efficiency,
+            hist_diff / self.simulator.discharge_efficiency
+        )
+
+        # Run training in the executor thread pool
+        await self.hass.async_add_executor_job(
+            self._train_models,
+            grid,
+            consumption,
+            outdoor_temp,
+            soc,
+            actual_solar,
+            raw_solar_forecast,
+            battery_temp,
+            charge_limit,
+            discharge_limit,
+            hist_net_flow,
+        )
+
+        self.last_trained = now
+
+    def _train_models(
+        self,
+        grid: list[datetime],
+        consumption: np.ndarray,
+        outdoor_temp: np.ndarray,
+        soc: np.ndarray,
+        actual_solar: np.ndarray,
+        raw_solar_forecast: np.ndarray,
+        battery_temp: np.ndarray,
+        charge_limit: np.ndarray,
+        discharge_limit: np.ndarray,
+        hist_net_flow: np.ndarray,
+    ) -> None:
+        """Fit all 5 ML models on aligned data."""
+        # 1. Consumption Model
+        try:
+            roll_mean_24 = compute_rolling_mean(consumption, 24)
+            roll_mean_24_shifted = np.roll(roll_mean_24, 1)
+            roll_mean_24_shifted[0] = roll_mean_24[0]
+
+            time_feats = extract_time_features(grid)
+            X_con = np.column_stack([
                 time_feats["time_sin"],
                 time_feats["time_cos"],
                 time_feats["day_sin"],
@@ -283,80 +531,151 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 time_feats["day_of_week"],
                 time_feats["is_weekend"],
                 roll_mean_24_shifted,
-                temps,
-            ]
-        )
-        y = values
+                outdoor_temp,
+            ])
 
-        # Train model
-        model = HistGradientBoostingRegressor(random_state=42, max_iter=50)
-        await self.hass.async_add_executor_job(model.fit, X, y)
+            c_model = HistGradientBoostingRegressor(random_state=42, max_iter=50)
+            c_model.fit(X_con, consumption)
+            self.consumption_model = c_model
+            self.recent_consumption_baseline = float(roll_mean_24[-1])
+            _LOGGER.info(
+                "Trained consumption model baseline: %.2f kW",
+                self.recent_consumption_baseline,
+            )
+        except Exception as err:
+            _LOGGER.error("Failed to train consumption model: %s", err)
 
-        self.model = model
-        self.last_trained = now
-        # Update current recent baseline (average consumption of the last 24h)
-        self.recent_consumption_baseline = float(roll_mean_24[-1])
-        _LOGGER.info(
-            "Successfully trained consumption model on %d samples. Current baseline: %.2f kW",
-            len(y),
-            self.recent_consumption_baseline,
-        )
+        # 2. Solar Forecast Refiner Model
+        if self.actual_solar_entity_id:
+            try:
+                # Censoring: exclude hours where SoC > 98% and actual solar is curtailed
+                non_clipped = (soc <= 98.0) | (actual_solar >= raw_solar_forecast - 0.1)
+                if np.sum(non_clipped) >= 24:
+                    X_sol = np.column_stack([
+                        time_feats["time_sin"][non_clipped],
+                        time_feats["time_cos"][non_clipped],
+                        time_feats["day_sin"][non_clipped],
+                        time_feats["day_cos"][non_clipped],
+                        time_feats["day_of_week"][non_clipped],
+                        time_feats["is_weekend"][non_clipped],
+                        raw_solar_forecast[non_clipped],
+                    ])
+                    y_sol = actual_solar[non_clipped]
 
-    def _train_fallback_model(self) -> None:
-        """Initialize a fallback model that returns static average patterns."""
-        self.model = None
-        self.last_trained = dt_util.utcnow()
-        # Fallback average consumption
-        self.recent_consumption_baseline = 0.5
+                    s_model = HistGradientBoostingRegressor(random_state=42, max_iter=50)
+                    s_model.fit(X_sol, y_sol)
+                    self.solar_model = s_model
+                    _LOGGER.info("Successfully trained Solar Refiner model.")
+                else:
+                    _LOGGER.warning(
+                        "Too few non-clipped solar samples. Skipping solar refiner training."
+                    )
+            except Exception as err:
+                _LOGGER.error("Failed to train solar refiner model: %s", err)
+
+        # 3. Battery Temperature Predictor Model
+        if self.battery_temp_entity_id:
+            try:
+                X_temp = np.column_stack([
+                    outdoor_temp,
+                    np.abs(hist_net_flow),
+                    hist_net_flow ** 2,
+                ])
+                t_model = Ridge(alpha=1.0)
+                t_model.fit(X_temp, battery_temp)
+                self.temp_model = t_model
+                _LOGGER.info("Successfully trained Battery Temperature Predictor.")
+            except Exception as err:
+                _LOGGER.error("Failed to train battery temperature model: %s", err)
+
+        # 4. BMS Charge Limit Model
+        if self.charge_limit_entity_id:
+            try:
+                X_lim = np.column_stack([soc, battery_temp])
+                chg_model = DecisionTreeRegressor(max_depth=4, random_state=42)
+                chg_model.fit(X_lim, charge_limit)
+                self.charge_limit_model = chg_model
+                _LOGGER.info("Successfully trained BMS Charge Limit model.")
+            except Exception as err:
+                _LOGGER.error("Failed to train BMS charge limit model: %s", err)
+
+        # 5. BMS Discharge Limit Model
+        if self.discharge_limit_entity_id:
+            try:
+                X_lim = np.column_stack([soc, battery_temp])
+                dis_model = DecisionTreeRegressor(max_depth=4, random_state=42)
+                dis_model.fit(X_lim, discharge_limit)
+                self.discharge_limit_model = dis_model
+                _LOGGER.info("Successfully trained BMS Discharge Limit model.")
+            except Exception as err:
+                _LOGGER.error("Failed to train BMS discharge limit model: %s", err)
 
     def _predict_consumption(
         self, datetimes: list[datetime], temperatures: list[float]
     ) -> list[float]:
         """Predict hourly consumption for the list of future datetimes and temperatures."""
-        if self.model is None:
-            # Fallback static diurnal profile if no model is trained
+        if self.consumption_model is None:
+            # Fallback static diurnal profile
             predictions = []
             for dt, temp in zip(datetimes, temperatures, strict=True):
-                # Diurnal profile: peaks morning (8:00) and evening (19:00)
                 hour = dt.hour + dt.minute / 60.0
                 morning_peak = 0.8 * np.exp(-0.5 * ((hour - 8.0) / 1.0) ** 2)
                 evening_peak = 1.5 * np.exp(-0.5 * ((hour - 19.0) / 1.5) ** 2)
                 val = self.recent_consumption_baseline + morning_peak + evening_peak
-                # HVAC adjustment based on temp (heating below 15°C, cooling above 25°C)
                 if temp < 15.0:
                     val += 0.08 * (15.0 - temp)
                 elif temp > 25.0:
                     val += 0.12 * (temp - 25.0)
-                if dt.weekday() >= 5:  # weekend boost
+                if dt.weekday() >= 5:
                     val *= 1.15
                 predictions.append(max(0.05, float(val)))
             return predictions
 
-        # Prepare features for the prediction grid
         time_feats = extract_time_features(datetimes)
         recent_baseline_feature = np.full(len(datetimes), self.recent_consumption_baseline)
 
-        X_pred = np.column_stack(
-            [
+        X_pred = np.column_stack([
+            time_feats["time_sin"],
+            time_feats["time_cos"],
+            time_feats["day_sin"],
+            time_feats["day_cos"],
+            time_feats["day_of_week"],
+            time_feats["is_weekend"],
+            recent_baseline_feature,
+            temperatures,
+        ])
+
+        preds = self.consumption_model.predict(X_pred)
+        return [max(0.05, float(p)) for p in preds]
+
+    def _predict_solar(
+        self, datetimes: list[datetime], raw_forecast: list[float]
+    ) -> list[float]:
+        """Predict refined solar production using the trained solar model."""
+        if self.solar_model is None:
+            return raw_forecast
+
+        try:
+            time_feats = extract_time_features(datetimes)
+            X_pred = np.column_stack([
                 time_feats["time_sin"],
                 time_feats["time_cos"],
                 time_feats["day_sin"],
                 time_feats["day_cos"],
                 time_feats["day_of_week"],
                 time_feats["is_weekend"],
-                recent_baseline_feature,
-                temperatures,
-            ]
-        )
-
-        preds = self.model.predict(X_pred)
-        return [max(0.05, float(p)) for p in preds]
+                raw_forecast,
+            ])
+            preds = self.solar_model.predict(X_pred)
+            return [max(0.0, float(p)) for p in preds]
+        except Exception as err:
+            _LOGGER.debug("Solar refiner prediction failed, falling back to raw: %s", err)
+            return raw_forecast
 
     async def _async_get_temperature_forecast(self) -> list[tuple[datetime, float]]:
         """Fetch future temperature forecast (datetime, °C) from weather/temperature entity."""
         forecast_list: list[tuple[datetime, float]] = []
 
-        # 1. Try calling the modern service weather.get_forecasts
         try:
             response = await self.hass.services.async_call(
                 "weather",
@@ -379,7 +698,6 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             _LOGGER.debug("Failed to call weather.get_forecasts service: %s", err)
 
-        # 2. Fallback: check weather entity state and attributes
         state = self.hass.states.get(self.weather_entity_id)
         if state:
             attrs = state.attributes
@@ -392,7 +710,6 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if ts:
                             forecast_list.append((ts, float(temp_val)))
 
-        # 3. Fallback: if direct temp sensor (no forecast), assume constant current temp
         if not forecast_list and state:
             try:
                 current_temp = float(state.state)
@@ -406,16 +723,14 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _interpolate_temperature_forecast(
         self, forecast_list: list[tuple[datetime, float]], target_grid: np.ndarray
     ) -> list[float]:
-        """Interpolate hourly temperature forecast into the target 5-minute grid."""
+        """Interpolate temperature forecast onto the target 5-minute grid."""
         if not forecast_list:
             return [20.0] * len(target_grid)
 
         forecast_times = np.array([ts.timestamp() for ts, _ in forecast_list])
         forecast_values = np.array([val for _, val in forecast_list])
-
         grid_times = np.array([ts.timestamp() for ts in target_grid])
 
-        # Run linear interpolation, fill using edge values outside range
         interpolated = np.interp(
             grid_times,
             forecast_times,
@@ -433,7 +748,6 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         attrs = state.attributes
 
-        # 1. Check if standard forecasts list exists (e.g. Forecast.Solar or Solcast)
         if "forecasts" in attrs and isinstance(attrs["forecasts"], list):
             for item in attrs["forecasts"]:
                 ts_val = item.get("period_start") or item.get("datetime") or item.get("time")
@@ -443,12 +757,10 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if ts:
                         forecast_list.append((ts, float(power_val)))
 
-        # 2. Check for Forecast.Solar dict format in "watt_hours" or "wh_period"
         elif "watt_hours" in attrs and isinstance(attrs["watt_hours"], dict):
             for key, val in attrs["watt_hours"].items():
                 ts = dt_util.parse_datetime(str(key))
                 if ts:
-                    # Convert Wh (hourly energy) to kW (average hourly power)
                     forecast_list.append((ts, float(val) / 1000.0))
 
         elif "wh_period" in attrs and isinstance(attrs["wh_period"], dict):
@@ -457,34 +769,29 @@ class SolarLensCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if ts:
                     forecast_list.append((ts, float(val) / 1000.0))
 
-        # 3. Check for standard weather forecast attribute
         elif "forecast" in attrs and isinstance(attrs["forecast"], list):
-            # Weather forecasts usually don't have fine solar forecasts, but we check just in case
             for item in attrs["forecast"]:
                 ts_val = item.get("datetime")
-                power_val = item.get("solar_production")  # some custom weather components
+                power_val = item.get("solar_production")
                 if ts_val is not None and power_val is not None:
                     ts = dt_util.parse_datetime(str(ts_val))
                     if ts:
                         forecast_list.append((ts, float(power_val)))
 
-        # Sort chronological
         forecast_list.sort(key=lambda x: x[0])
         return forecast_list
 
     def _interpolate_solar_forecast(
         self, forecast_list: list[tuple[datetime, float]], target_grid: np.ndarray
     ) -> list[float]:
-        """Interpolate parsed hourly solar forecast into the target 5-minute grid."""
+        """Interpolate hourly solar forecast into the target 5-minute grid."""
         if not forecast_list:
             return [0.0] * len(target_grid)
 
         forecast_times = np.array([ts.timestamp() for ts, _ in forecast_list])
         forecast_values = np.array([val for _, val in forecast_list])
-
         grid_times = np.array([ts.timestamp() for ts in target_grid])
 
-        # Run linear interpolation, fill 0.0 outside forecast range (e.g. night or past)
         interpolated = np.interp(grid_times, forecast_times, forecast_values, left=0.0, right=0.0)
         return [max(0.0, float(v)) for v in interpolated]
 

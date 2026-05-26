@@ -25,6 +25,8 @@ class SolarBatterySimulator:
         solar: float,
         consumption: float,
         dt: float,
+        max_charge_power_kw: float = float("inf"),
+        max_discharge_power_kw: float = float("inf"),
     ) -> tuple[float, float, float, float]:
         """Update battery state of charge and return updated energy and flows.
 
@@ -33,51 +35,64 @@ class SolarBatterySimulator:
             solar: Solar production power (kW) during this step.
             consumption: House consumption power (kW) during this step.
             dt: Time step duration (hours).
+            max_charge_power_kw: Maximum DC charge power limit (kW).
+            max_discharge_power_kw: Maximum DC discharge power limit (kW).
 
         Returns:
             Tuple of (new_battery_energy, net_flow_kw, wasted_solar_kw, grid_import_kw)
+            where net_flow_kw is the DC terminal power flow
+            (positive for charge, negative for discharge).
         """
         diff = solar - consumption
         wasted_solar = 0.0
         grid_import = 0.0
-        prev_energy = battery_energy
 
         if diff > 0:  # Excess Solar: charge battery
-            charge_power = diff * self.charge_efficiency
-            new_energy = battery_energy + charge_power * dt
+            potential_dc_charge = diff * self.charge_efficiency
+            dc_charge = min(potential_dc_charge, max_charge_power_kw)
+            new_energy = battery_energy + dc_charge * dt
             max_energy = self.battery_capacity_kwh
 
             if new_energy > max_energy:
-                # Battery is full, excess solar is wasted (or exported)
-                wasted_power = (new_energy - max_energy) / dt / self.charge_efficiency
-                wasted_solar = wasted_power
+                # Battery is full
                 new_energy = max_energy
-                net_flow = (max_energy - prev_energy) / dt
+                actual_dc_charge = (max_energy - battery_energy) / dt
+                wasted_solar = diff - (actual_dc_charge / self.charge_efficiency)
+                net_flow = actual_dc_charge
             else:
-                new_energy = new_energy
-                net_flow = diff
-        else:  # Deficit: discharge battery
-            discharge_power = abs(diff) / self.discharge_efficiency
-            new_energy = battery_energy - discharge_power * dt
+                wasted_solar = diff - (dc_charge / self.charge_efficiency)
+                net_flow = dc_charge
+        else:  # Deficit or zero: discharge battery
+            potential_dc_discharge = abs(diff) / self.discharge_efficiency
+            dc_discharge = min(potential_dc_discharge, max_discharge_power_kw)
+            new_energy = battery_energy - dc_discharge * dt
             min_energy = (self.min_soc / 100.0) * self.battery_capacity_kwh
 
             if new_energy < min_energy:
-                # Battery empty, import remaining deficit from grid
-                shortage_power = (min_energy - new_energy) / dt * self.discharge_efficiency
-                grid_import = shortage_power
+                # Battery empty
                 new_energy = min_energy
-                net_flow = (min_energy - prev_energy) / dt
+                actual_dc_discharge = (battery_energy - min_energy) / dt
+                grid_import = abs(diff) - (actual_dc_discharge * self.discharge_efficiency)
+                net_flow = -actual_dc_discharge
             else:
-                new_energy = new_energy
-                net_flow = diff
+                grid_import = abs(diff) - (dc_discharge * self.discharge_efficiency)
+                net_flow = -dc_discharge
 
-        return new_energy, net_flow, wasted_solar, grid_import
+        # Float correction to prevent tiny negative wastes/imports
+        return (
+            new_energy,
+            float(net_flow),
+            max(0.0, float(wasted_solar)),
+            max(0.0, float(grid_import)),
+        )
 
     def run_simulation(
         self,
         initial_soc: float,
         solar_forecast: list[float] | np.ndarray,
         consumption_forecast: list[float] | np.ndarray,
+        max_charge_power_forecast: list[float] | np.ndarray | None = None,
+        max_discharge_power_forecast: list[float] | np.ndarray | None = None,
         dt: float = 5.0 / 60.0,
     ) -> dict[str, list[float]]:
         """Run the simulation step-by-step for the given forecasts.
@@ -95,12 +110,22 @@ class SolarBatterySimulator:
         grid_import = []
         net_flow = []
 
+        if max_charge_power_forecast is None:
+            max_charge_power_forecast = [float("inf")] * n_steps
+        if max_discharge_power_forecast is None:
+            max_discharge_power_forecast = [float("inf")] * n_steps
+
         current_soc = initial_soc
         battery_energy = (current_soc / 100.0) * self.battery_capacity_kwh
 
         for i in range(n_steps):
             battery_energy, net_flow_val, wasted, imported = self.update_battery_state(
-                battery_energy, solar_forecast[i], consumption_forecast[i], dt
+                battery_energy,
+                solar_forecast[i],
+                consumption_forecast[i],
+                dt,
+                max_charge_power_forecast[i],
+                max_discharge_power_forecast[i],
             )
             wasted_solar.append(float(wasted))
             grid_import.append(float(imported))

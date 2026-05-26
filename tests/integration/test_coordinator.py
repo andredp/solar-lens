@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "custom_components"
 
 from homeassistant.util import dt as dt_util
 
+from solar_lens.binary_sensor import SolarLensWillBatteryLastTheNight
 from solar_lens.coordinator import SolarLensCoordinator
 from solar_lens.sensor import (
     SolarLensBatteryEmptyTime,
@@ -20,7 +21,6 @@ from solar_lens.sensor import (
     SolarLensGapHours,
     SolarLensPredictionCurve,
     SolarLensTomorrowSunsetSoCEstimate,
-    SolarLensWillBatteryLastTheNight,
 )
 
 
@@ -34,6 +34,14 @@ def mock_hass() -> MagicMock:
         return func(*args, **kwargs)
 
     hass.async_add_executor_job = AsyncMock(side_effect=mock_async_add_job)
+
+    # Mock async_create_background_task to await the task or run immediately
+    def mock_async_create_task(target, name=None):
+        task = MagicMock()
+        task.done.return_value = True
+        return task
+
+    hass.async_create_background_task = MagicMock(side_effect=mock_async_create_task)
     return hass
 
 
@@ -47,6 +55,11 @@ def mock_config_entry() -> MagicMock:
         "solar_forecast_entity": "sensor.solar_forecast",
         "weather_entity": "sensor.outdoor_temperature",
         "battery_capacity_kwh": 7.2,
+        "actual_solar_entity": "sensor.actual_solar",
+        "charge_limit_entity": "sensor.charge_limit",
+        "discharge_limit_entity": "sensor.discharge_limit",
+        "battery_voltage_entity": "sensor.battery_voltage",
+        "battery_temp_entity": "sensor.battery_temp",
     }
     entry.entry_id = "test_entry_id"
     return entry
@@ -84,14 +97,41 @@ async def test_coordinator_update_success(
             weather_state.state = "20.0"
             weather_state.attributes = {}
             return weather_state
+        if entity_id == "sensor.actual_solar":
+            actual_solar_state = MagicMock()
+            actual_solar_state.state = "1.5"
+            return actual_solar_state
+        if entity_id == "sensor.charge_limit":
+            charge_limit_state = MagicMock()
+            charge_limit_state.state = "75.0"
+            return charge_limit_state
+        if entity_id == "sensor.discharge_limit":
+            discharge_limit_state = MagicMock()
+            discharge_limit_state.state = "75.0"
+            return discharge_limit_state
+        if entity_id == "sensor.battery_voltage":
+            voltage_state = MagicMock()
+            voltage_state.state = "50.0"
+            return voltage_state
+        if entity_id == "sensor.battery_temp":
+            temp_state = MagicMock()
+            temp_state.state = "22.0"
+            temp_state.attributes = {"unit_of_measurement": "°C"}
+            return temp_state
         return None
 
     mock_hass.states.get = mock_get_state
 
-    # 2. Mock historical statistics for consumption & temperature
+    # 2. Mock historical statistics for all entities
     # Generate 48 hours of statistics (2 days of history)
     mock_stats = []
     mock_temp_stats = []
+    mock_actual_solar_stats = []
+    mock_charge_limit_stats = []
+    mock_discharge_limit_stats = []
+    mock_battery_temp_stats = []
+    mock_battery_voltage_stats = []
+
     for i in range(48):
         stat_time = now - timedelta(hours=48 - i)
         mock_stats.append(
@@ -106,10 +146,46 @@ async def test_coordinator_update_success(
                 "mean": 18.0,
             }
         )
+        mock_actual_solar_stats.append(
+            {
+                "start": stat_time.timestamp(),
+                "mean": 1.0 if 8 <= i % 24 <= 17 else 0.0,
+            }
+        )
+        mock_charge_limit_stats.append(
+            {
+                "start": stat_time.timestamp(),
+                "mean": 75.0,
+            }
+        )
+        mock_discharge_limit_stats.append(
+            {
+                "start": stat_time.timestamp(),
+                "mean": 75.0,
+            }
+        )
+        mock_battery_temp_stats.append(
+            {
+                "start": stat_time.timestamp(),
+                "mean": 22.0,
+            }
+        )
+        mock_battery_voltage_stats.append(
+            {
+                "start": stat_time.timestamp(),
+                "mean": 50.0,
+            }
+        )
 
     mock_stats_dict = {
         "sensor.house_consumption": mock_stats,
         "sensor.outdoor_temperature": mock_temp_stats,
+        "sensor.actual_solar": mock_actual_solar_stats,
+        "sensor.charge_limit": mock_charge_limit_stats,
+        "sensor.discharge_limit": mock_discharge_limit_stats,
+        "sensor.battery_temp": mock_battery_temp_stats,
+        "sensor.battery_voltage": mock_battery_voltage_stats,
+        "sensor.solar_forecast": mock_actual_solar_stats,
     }
 
     # Patch statistics_during_period to return our mock stats
@@ -118,6 +194,9 @@ async def test_coordinator_update_success(
         return_value=mock_stats_dict,
     ):
         coordinator = SolarLensCoordinator(mock_hass, mock_config_entry)
+
+        # Retrain models first to make sure they fit
+        await coordinator._async_retrain_models()
 
         # Force a refresh
         await coordinator.async_refresh()
@@ -151,6 +230,6 @@ async def test_coordinator_update_success(
         assert sensor_resume.native_value == data["charge_resume_time"]
         assert sensor_gap.native_value == data["gap_hours"]
         assert sensor_sunset.native_value == data["tomorrow_sunset_soc_estimate"]
-        assert sensor_will_last.native_value == data["will_battery_last_the_night"]
+        assert sensor_will_last.is_on == data["will_battery_last_the_night"]
         assert sensor_curve.native_value == len(data["prediction_curve"])
         assert sensor_curve.extra_state_attributes["prediction_curve"] == data["prediction_curve"]

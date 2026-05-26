@@ -8,6 +8,7 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -27,7 +28,6 @@ async def async_setup_entry(
         SolarLensChargeResumeTime(coordinator),
         SolarLensGapHours(coordinator),
         SolarLensTomorrowSunsetSoCEstimate(coordinator),
-        SolarLensWillBatteryLastTheNight(coordinator),
         SolarLensPredictionCurve(coordinator),
     ]
 
@@ -45,6 +45,16 @@ class SolarLensBaseSensor(CoordinatorEntity[SolarLensCoordinator], SensorEntity)
         self._key = key
         self._attr_name = name
         self._attr_unique_id = f"{DOMAIN}_{key}"
+
+    @property
+    def device_info(self) -> DeviceInfo | None:
+        """Return device information to link entities."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.entry.entry_id)},
+            name="Solar Lens",
+            manufacturer="Solar Lens Team",
+            model="Battery Prediction Engine",
+        )
 
 
 class SolarLensBatteryRemaining(SolarLensBaseSensor):
@@ -143,23 +153,6 @@ class SolarLensTomorrowSunsetSoCEstimate(SolarLensBaseSensor):
         val = self.coordinator.data.get("tomorrow_sunset_soc_estimate")
         return float(val) if val is not None else None
 
-
-class SolarLensWillBatteryLastTheNight(SolarLensBaseSensor):
-    """Sensor showing whether the battery is predicted to last the night."""
-
-    _attr_icon = "mdi:weather-night-lounge"
-
-    def __init__(self, coordinator: SolarLensCoordinator) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator, "Will Battery Last the Night", "will_battery_last_the_night")
-
-    @property
-    def native_value(self) -> bool | None:
-        """Return True if the battery is predicted to last the night."""
-        if not self.coordinator.data:
-            return None
-        val = self.coordinator.data.get("will_battery_last_the_night")
-        return bool(val) if val is not None else None
 
 
 class SolarLensPredictionCurve(SolarLensBaseSensor):
