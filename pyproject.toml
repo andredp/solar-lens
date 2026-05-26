@@ -1,15 +1,15 @@
 [project]
 name = "solar-lens"
-version = "0.1.0"
+version = "0.3.0"
 description = "Intelligent solar battery prediction and energy optimization for Home Assistant"
-requires-python = ">=3.13.2"
+requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
 authors = [{ name = "andredp" }]
 readme = "README.md"
 
 dependencies = [
-    "scikit-learn==1.6.1",
-    "numpy>=1.26.0",
+    "scikit-learn>=1.8.0",
+    "numpy>=2.1.0",
 ]
 
 [dependency-groups]
